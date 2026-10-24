@@ -2,9 +2,10 @@
 # Expose the API running on this machine through ngrok, as the organisers' API contract expects.
 # One-time setup (free ngrok account):
 #   ngrok config add-authtoken <your token>          # from dashboard.ngrok.com
-#   claim your free static dev domain on the dashboard (e.g. abc123.ngrok-free.dev)
+#   free accounts get a static dev domain automatically (e.g. abc123.ngrok-free.dev)
 # Then:
-#   NGROK_DOMAIN=abc123.ngrok-free.dev ./scripts/tunnel.sh      start API + tunnel (detached)
+#   ./scripts/tunnel.sh                                          start API + tunnel (detached)
+#   NGROK_DOMAIN=abc123.ngrok-free.dev ./scripts/tunnel.sh      same, pinning a specific domain
 #   ./scripts/tunnel.sh stop                                     stop both
 # With the static domain the URL never changes, so the API can be restarted safely;
 # do not stop the tunnel after submitting the URL. The Mac is kept awake while they run.
@@ -20,7 +21,6 @@ if [ "${1:-}" = "stop" ]; then
 fi
 
 command -v ngrok >/dev/null || { echo "install ngrok first: brew install ngrok"; exit 1; }
-[ -n "${NGROK_DOMAIN:-}" ] || { echo "set NGROK_DOMAIN to your static ngrok domain (see header of this script)"; exit 1; }
 
 if ! curl -fsS "http://localhost:$PORT/health" >/dev/null 2>&1; then
   # caffeinate -i: keep the machine from idle-sleeping while the API runs
@@ -31,8 +31,15 @@ fi
 curl -fsS "http://localhost:$PORT/health" >/dev/null || { echo "API did not start; see data/api.log"; exit 1; }
 
 if ! pgrep -f "ngrok http" >/dev/null; then
-  nohup caffeinate -i ngrok http "$PORT" --url "https://$NGROK_DOMAIN" --log stdout > data/ngrok.log 2>&1 &
-  sleep 5
+  URL_ARG=()
+  [ -n "${NGROK_DOMAIN:-}" ] && URL_ARG=(--url "https://$NGROK_DOMAIN")
+  nohup caffeinate -i ngrok http "$PORT" ${URL_ARG[@]+"${URL_ARG[@]}"} --log stdout > data/ngrok.log 2>&1 &
 fi
-echo "https://$NGROK_DOMAIN" > data/tunnel_url.txt
-curl -fsS -H "ngrok-skip-browser-warning: true" "https://$NGROK_DOMAIN/health" && echo "  <- public endpoint: https://$NGROK_DOMAIN"
+URL=""
+for _ in $(seq 1 30); do  # the agent's local API reports the public URL
+  URL=$(curl -fsS http://127.0.0.1:4040/api/tunnels 2>/dev/null | grep -oE '"public_url":"https://[^"]+' | head -1 | cut -d'"' -f4 || true)
+  [ -n "$URL" ] && break; sleep 1
+done
+[ -n "$URL" ] || { echo "ngrok did not come up; see data/ngrok.log"; exit 1; }
+echo "$URL" > data/tunnel_url.txt
+curl -fsS -H "ngrok-skip-browser-warning: true" "$URL/health" && echo "  <- public endpoint: $URL"
