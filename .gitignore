@@ -1,0 +1,19 @@
+# secrets / local env
+.env
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+
+# runtime data (collections, caches, benchmark outputs)
+data/
+runs/
+
+# organisers' dataset and brief (not redistributed; place Train/ here to run the dev scripts)
+Train/
+Train.zip
+*.docx
+
+# local-only history (previous pipeline snapshot, development log)
+snapshots/
+implemented_approach.md

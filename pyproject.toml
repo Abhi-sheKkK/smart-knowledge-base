@@ -1,0 +1,22 @@
+[project]
+name = "smart-kb"
+version = "0.1.0"
+description = "Smart Knowledge Base for Agents - hackathon"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "pymupdf==1.26.5",  # 2.0 segfaults in find_tables on some PDFs
+  "pytesseract>=0.3.10",
+  "pillow>=10",
+  "fastapi>=0.110",
+  "uvicorn>=0.29",
+  "python-multipart>=0.0.9",
+  "httpx>=0.27",
+  "numpy>=1.26",
+  "rank-bm25>=0.2.2",
+  "fastembed>=0.3",
+  "datasketch>=1.6",
+  "langfuse>=2.0",
+  "python-dotenv>=1.0",
+  "requests>=2.31",
+  "anthropic>=2.2",
+]
