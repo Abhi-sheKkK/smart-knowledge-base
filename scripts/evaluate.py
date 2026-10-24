@@ -106,7 +106,7 @@ def main():
             "query": g["question"],
             "ai_answer": r["answer"],
             "benchmark_answer": g["benchmark_answer"],
-            "retrieved_chunks": [c["text"] for c in r["chunks"]],
+            "retrieved_chunks": [c.get("content", c.get("text")) for c in r["chunks"]],
             "benchmark_chunks": [c["content"] for v in g["benchmark_chunks_w_metadata"].values() for c in v],
         }
         try:

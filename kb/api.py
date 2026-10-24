@@ -1,11 +1,10 @@
-"""HTTP API: POST /index (zip + collection_name), GET /index/status, POST /query.
+"""HTTP API per the organisers' contract: POST /index (zip + collection_name) and POST /query.
 
-/index validates the upload synchronously (400 on a bad / PDF-less zip), then builds the
-collection in a background thread while the response streams a newline every few seconds
-(leading whitespace is valid JSON). Proxies that close idle or long requests (e.g. Railway:
-5 min without data, 15 min total) therefore see a live connection, and the final line is the
-JSON result. If indexing outlasts INDEX_WAIT_SECONDS, the response says it is still running
-and GET /index/status reports completion."""
+/index is synchronous: the first 2xx means the collection is ready. Tunnels such as ngrok
+close a connection after 5 minutes without data, so if indexing is still running after
+EARLY_RESPONSE_SECONDS the response is started (200) and keep-alive whitespace is streamed
+until the final JSON (leading whitespace is valid JSON). Indexing that finishes before that
+gets a normal response, including a real non-2xx status on failure."""
 from __future__ import annotations
 
 import asyncio
@@ -20,17 +19,16 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from . import index, query, store
 
-INDEX_WAIT_SECONDS = float(os.getenv("INDEX_WAIT_SECONDS", "780"))  # stay under a 15-minute proxy cap
-HEARTBEAT_SECONDS = 15
+EARLY_RESPONSE_SECONDS = float(os.getenv("EARLY_RESPONSE_SECONDS", "240"))  # under ngrok's 5-min idle limit
+HEARTBEAT_SECONDS = 20
 
 app = FastAPI(title="Smart Knowledge Base")
 _index_lock = threading.Lock()  # one ingestion at a time; parsing already uses every core
-_jobs: dict[str, dict] = {}  # collection_name -> {"state": indexing|success|error, ...}
 
 
 class QueryIn(BaseModel):
@@ -38,14 +36,16 @@ class QueryIn(BaseModel):
     query: str
 
 
-def _job_payload(name: str, job: dict) -> dict:
-    elapsed = round((job.get("finished") or time.time()) - job["started"], 1)
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+def _result(name: str, job: dict) -> tuple[int, dict]:
     if job["state"] == "success":
-        return {"status": "success", "collection_name": name, "stats": job["stats"]}
-    if job["state"] == "error":
-        return {"status": "error", "collection_name": name, "detail": job["detail"], "elapsed_seconds": elapsed}
-    return {"status": "indexing", "collection_name": name, "elapsed_seconds": elapsed,
-            "detail": f"indexing continues in the background; poll GET /index/status?collection_name={name}"}
+        s = job["stats"]
+        return 200, {"status": "success", "collection_name": name, "documents_indexed": s.get("documents"), "stats": s}
+    return job.get("code", 500), {"status": "error", "collection_name": name, "detail": job["detail"]}
 
 
 def _run_job(name: str, pdfs: list[Path], skipped: list[str], job: dict):
@@ -54,23 +54,16 @@ def _run_job(name: str, pdfs: list[Path], skipped: list[str], job: dict):
             stats = index.build_collection(name, pdfs)
             stats["skipped_non_pdf"] = skipped
             job.update(state="success", stats=stats)
-        except Exception as e:  # e.g. LLM unavailable during card generation; previous collection untouched
-            job.update(state="error", detail=f"{type(e).__name__}: {e}"[:1000])
-        finally:
-            job["finished"] = time.time()
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
+        except RuntimeError as e:  # LLM unavailable during card generation; previous collection untouched
+            job.update(state="error", code=502, detail=str(e)[:1000])
+        except Exception as e:
+            job.update(state="error", code=500, detail=f"{type(e).__name__}: {e}"[:1000])
 
 
 @app.post("/index")
 async def index_endpoint(file: UploadFile = File(...), collection_name: str = Form(...)):
     if not file.filename.lower().endswith(".zip"):
         raise HTTPException(400, "file must be a .zip of documents")
-    if any(j["state"] == "indexing" for j in _jobs.values()):
-        raise HTTPException(409, "another indexing job is running; retry when GET /index/status reports it finished")
     tmp = Path(tempfile.mkdtemp())
     zpath = tmp / "upload.zip"
     with zpath.open("wb") as f:
@@ -84,44 +77,38 @@ async def index_endpoint(file: UploadFile = File(...), collection_name: str = Fo
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
-    job = {"state": "indexing", "started": time.time()}
-    _jobs[collection_name] = job
+    job = {"state": "running", "started": time.time()}
     threading.Thread(target=_run_job, args=(collection_name, pdfs, skipped, job), daemon=True).start()
 
+    # finished early: an ordinary response with its real status code
+    while job["state"] == "running" and time.time() - job["started"] < EARLY_RESPONSE_SECONDS:
+        await asyncio.sleep(1)
+    if job["state"] != "running":
+        code, body = _result(collection_name, job)
+        return JSONResponse(body, status_code=code)
+
+    # still running: start the 200 response and keep the connection alive until done
     async def stream():
-        last_beat = time.time()
-        while job["state"] == "indexing" and time.time() - job["started"] < INDEX_WAIT_SECONDS:
+        last = time.time()
+        while job["state"] == "running":
             await asyncio.sleep(1)
-            if time.time() - last_beat >= HEARTBEAT_SECONDS:
-                last_beat = time.time()
-                yield b"\n"  # keep-alive; whitespace before the JSON body is still valid JSON
-        yield json.dumps(_job_payload(collection_name, job)).encode()
+            if time.time() - last >= HEARTBEAT_SECONDS:
+                last = time.time()
+                yield b" \n"
+        yield json.dumps(_result(collection_name, job)[1]).encode()
 
     return StreamingResponse(stream(), media_type="application/json")
-
-
-@app.get("/index/status")
-def index_status(collection_name: str):
-    job = _jobs.get(collection_name)
-    if job:
-        return _job_payload(collection_name, job)
-    try:
-        return {"status": "success", "collection_name": collection_name, "stats": store.load(collection_name).meta}
-    except FileNotFoundError:
-        raise HTTPException(404, f"collection '{collection_name}' is not indexed")
 
 
 @app.post("/query")
 async def query_endpoint(body: QueryIn):
     try:
         store.load(body.collection_name)
-    except FileNotFoundError as e:
-        if _jobs.get(body.collection_name, {}).get("state") == "indexing":
-            raise HTTPException(409, f"collection '{body.collection_name}' is still being indexed")
-        raise HTTPException(404, str(e))
+    except FileNotFoundError:
+        raise HTTPException(404, "unknown collection")
     try:
         res = await run_in_threadpool(query.run_query, body.collection_name, body.query)
-    except RuntimeError as e:  # LLM provider failure
+    except RuntimeError as e:  # LLM provider failure (the harness retries 5xx)
         raise HTTPException(502, str(e))
     return {
         "answer": res["answer"],

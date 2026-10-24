@@ -8,7 +8,7 @@ Two pipelines share a named collection. **Indexing** (`POST /index`) turns an un
 |---|---|
 | Indexing | ≈ 15 min cold for 36 PDFs, 7,091 pages (8 cores); 48 LLM calls ≈ $0.05; re-indexing unchanged files: seconds |
 | Query | 23.4 s average · $0.016 · ≈ 130k input + 6k output tokens · 22 LLM calls (≈ 20 of them parallel grading) |
-| Quality (held-out 20) | Answer P 0.37 · Answer R 0.56 · Context P 0.86 · Context R 0.54 |
+| Quality (held-out 20) | Answer P 0.37 · Answer R 0.56 · Context P 0.55 · Context R 0.41 (page-based, as the contract scores it) |
 
 ## 2. Indexing — `POST /index` (`kb/parse.py`, `kb/index.py`)
 
@@ -40,26 +40,25 @@ Two pipelines share a named collection. **Indexing** (`POST /index`) turns an un
 
 ## 4. Performance
 
-Scored with the organisers' evaluation notebook code, unmodified; its configured judge (a reasoning model) cannot score long answers within its token budget, so its requests were answered by Claude Haiku 5.5. The ceiling row scores the gold answers and gold chunks as if they were our output.
+Answer metrics: the organisers' evaluation notebook code, unmodified (its configured judge, a reasoning model, cannot score long answers within its token budget, so its requests were answered by Claude Haiku 5.5). Context metrics: as the API contract defines them — a chunk is relevant when its document matches a benchmark document and its pages overlap that passage's pages; recall is the share of benchmark (document, page) pairs covered (`scripts/page_metrics.py`, no LLM).
 
-| Question set | Answer P | Answer R | Context P | Context R | Latency | Cost / query |
+| Question set | Answer P | Answer R | Context P (pages) | Context R (pages) | Latency | Cost / query |
 |---|---|---|---|---|---|---|
-| Development (20) | 0.32 | 0.62 | 0.92 | 0.57 | 24.4 s | $0.017 |
-| Held-out (20, never used for tuning) | 0.37 | 0.56 | 0.86 | 0.54 | 22.4 s | $0.016 |
-| Judge ceiling | ≈ 0.95 | ≈ 0.97 | ≈ 0.78 | ≈ 0.78 | | |
+| Development (20) | 0.32 | 0.62 | 0.53 | 0.42 | 24.4 s | $0.017 |
+| Held-out (20, never used for tuning) | 0.37 | 0.56 | 0.55 | 0.41 | 22.4 s | $0.016 |
+| Answer-judge ceiling (gold answer scored as ours) | ≈ 0.95 | ≈ 0.97 | | | | |
 
-Latency breakdown (40-question average): route 3.8 s · retrieve 0.4 s · grade 11.5 s · answer 7.5 s. Context precision exceeds what the judge awards the gold chunks; held-out matches development; the remaining gap is answer composition.
+Latency breakdown (40-question average): route 3.8 s · retrieve 0.4 s · grade 11.5 s · answer 7.5 s. Held-out matches development. Returning grade-1 context passages as well raises page recall to 0.63 at a precision of 0.39 (an earlier configuration), so the chunk-return threshold trades the two context metrics directly.
 
 ## 5. API and operations
 
 | Endpoint | Input | Output / errors |
 |---|---|---|
-| `POST /index` | multipart `file` (zip) + `collection_name` | streams keep-alive newlines, then `{"status": "success", "stats"}` when complete (`"error"` with the reason, e.g. LLM unavailable — previous collection untouched; `"indexing"` if it outlasts ~13 min); 400 at once for a bad / PDF-less zip |
-| `GET /index/status` | `collection_name` | indexing / success (+ stats) / error |
-| `POST /query` | JSON `collection_name`, `query` | answer, chunks, trace, metadata; 404 unknown collection; 409 still indexing; 502 if the LLM is unavailable |
+| `POST /index` | multipart `file` (zip, sub-folders allowed) + `collection_name` | synchronous: 200 `{"status": "success", "collection_name", "documents_indexed"}` once queryable; 400 bad / PDF-less zip; 502 LLM unavailable (previous collection untouched). After 4 min the 200 is started and keep-alive whitespace streamed until the final JSON (tunnels close connections idle for 5 min) |
+| `POST /query` | JSON `collection_name`, `query` | `answer`, `chunks` [`{content, metadata: {file_name, page_numbers}}`, file names as in the corpus, 1-based pages], four-field `trace`; 404 `{"detail": "unknown collection"}`; 200 with an honest answer and empty chunks when the documents lack the answer; 502 LLM unavailable |
 | `GET /health` | — | `{"status": "ok"}` |
 
-Deployment: Docker image (Python 3.12 + Tesseract, pinned dependencies, embedding model baked in, `/data` volume, listens on `$PORT`), deployed on Railway (`railway.json`: Dockerfile build, `/health` check) for a public HTTPS endpoint, or `scripts/serve.sh` on any Linux server. The streamed `/index` response keeps proxies that close idle or long requests (Railway: 5 min idle, 15 min total) from cutting off ingestion. Stated ingestion time: ~15 min cold for ~7,000 pages on 8 cores (quote 20–25 min with headroom).
+Deployment: served from a laptop through ngrok with a static domain (`scripts/tunnel.sh`, keeps the machine awake), as the contract describes; also a Docker image (Python 3.12 + Tesseract, pinned dependencies, embedding model baked in, `/data` volume, `$PORT`) for Railway (`railway.json`) or any Linux server. Stated ingestion time: ~15 min cold for ~7,000 pages on 8 cores (quote 20–25 min with headroom).
 
 ## 6. Design decisions (measured on the same questions)
 

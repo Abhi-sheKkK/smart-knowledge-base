@@ -155,6 +155,9 @@ def _embed_cached(texts: list[str]) -> np.ndarray:
     return np.stack([cache[k] for k in keys])
 
 
+NAMES_FILE = "_names.json"  # stored PDF name -> file name as it appears in the uploaded corpus
+
+
 def build_collection(name: str, pdf_paths: list[Path], log=print) -> dict:
     t0 = time.time()
     usage = llm.Usage()
@@ -165,10 +168,13 @@ def build_collection(name: str, pdf_paths: list[Path], log=print) -> dict:
 
     # 1. parse
     docs = []
+    names_file = pdf_paths[0].parent / NAMES_FILE if pdf_paths else None
+    original = json.loads(names_file.read_text()) if names_file and names_file.exists() else {}
     with PagePool(config.WORKERS) as pool:
         for i, p in enumerate(sorted(pdf_paths, key=lambda x: x.name.lower())):
             t = time.time()
             d = _parse_cached(p, f"d{i:03d}", pool)
+            d["filename"] = original.get(p.name, p.name)
             docs.append(d)
             log(f"parsed {p.name}: {d['n_pages']}p, {len(d['units'])} units, {len(d['ocr_pages'])} OCR pages ({time.time()-t:.1f}s)")
     t_parse = time.time() - t0
@@ -282,6 +288,7 @@ def extract_zip(name: str, zip_path: Path, log=print) -> tuple[list[Path], list[
     shutil.rmtree(raw, ignore_errors=True)
     raw.mkdir(parents=True)
     skipped: list[str] = []
+    names: dict[str, str] = {}
     with zipfile.ZipFile(zip_path) as z:
         for m in z.infolist():
             if m.is_dir() or "__MACOSX" in m.filename or Path(m.filename).name.startswith("."):
@@ -296,6 +303,9 @@ def extract_zip(name: str, zip_path: Path, log=print) -> tuple[list[Path], list[
                 k += 1
             with z.open(m) as src, target.open("wb") as dst:
                 shutil.copyfileobj(src, dst)
+            names[target.name] = Path(m.filename).name
+    # chunks must cite the file name exactly as it appears in the corpus, even if renamed here
+    (raw / NAMES_FILE).write_text(json.dumps(names))
     pdfs = sorted(raw.glob("*.pdf"))
     if not pdfs:
         raise ValueError(f"the zip contains no PDF files (skipped: {skipped[:20]})")

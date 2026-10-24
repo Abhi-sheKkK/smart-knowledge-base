@@ -48,7 +48,7 @@ def main():
                 print(f"{r['id']} FAILED: {e}", flush=True)
                 continue
             gold_docs = set(r["benchmark_chunks_w_metadata"])
-            got_docs = {c["document"] for c in res["chunks"]}
+            got_docs = {c["metadata"]["file_name"] for c in res["chunks"]}
             rec = {"id": r["id"], "question": r["question"], "answer": res["answer"], "chunks": res["chunks"],
                    "usage": res["usage"], "latency_seconds": res["latency_seconds"], "step_seconds": res["step_seconds"],
                    "trace": res["trace"]}

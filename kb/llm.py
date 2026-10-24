@@ -60,6 +60,16 @@ class _Retryable(Exception):
     pass
 
 
+class _Fatal(Exception):
+    """A provider error that retrying cannot fix (spent budget / quota): fail fast so callers
+    and proxies (e.g. Cloudflare's 100 s limit) get an error in seconds, not minutes."""
+
+
+def _is_budget_error(text: str) -> bool:
+    t = text.lower()
+    return "budget" in t or "quota" in t or "insufficient" in t or "credit" in t
+
+
 _reasoning_ok = True
 _http = httpx.Client(timeout=httpx.Timeout(180.0, connect=15.0), limits=httpx.Limits(max_connections=32))
 
@@ -67,7 +77,7 @@ _http = httpx.Client(timeout=httpx.Timeout(180.0, connect=15.0), limits=httpx.Li
 @lru_cache(maxsize=1)
 def _claude() -> anthropic.Anthropic:
     return anthropic.Anthropic(api_key=config.OPENCODE_API_KEY, base_url=config.ANTHROPIC_BASE_URL,
-                               timeout=180.0, max_retries=2)
+                               timeout=180.0, max_retries=0)  # retries are handled in chat(); the SDK would honour long retry-after waits
 
 
 def _parse_json(text: str) -> dict:
@@ -102,7 +112,9 @@ def _call_claude(model: str, system: str, user: str, max_tokens: int, json_mode:
             system=system,
             messages=[{"role": "user", "content": user}],
         )
-    except (anthropic.RateLimitError, anthropic.APIConnectionError, anthropic.InternalServerError) as e:
+    except anthropic.RateLimitError as e:
+        raise (_Fatal if _is_budget_error(str(e)) else _Retryable)(str(e)) from e
+    except (anthropic.APIConnectionError, anthropic.InternalServerError) as e:
         raise _Retryable(str(e)) from e
     u = r.usage
     p = (u.input_tokens or 0) + (u.cache_read_input_tokens or 0) + (u.cache_creation_input_tokens or 0)
@@ -131,6 +143,8 @@ def _call_openai(model: str, system: str, user: str, max_tokens: int, json_mode:
             r = _http.post(config.OPENCODE_BASE_URL, headers=headers, json=payload)
     except httpx.HTTPError as e:
         raise _Retryable(str(e)) from e
+    if r.status_code == 429 and _is_budget_error(r.text):
+        raise _Fatal(f"{r.status_code}: {r.text[:200]}")
     if r.status_code == 429 or r.status_code >= 500:
         raise _Retryable(f"{r.status_code}: {r.text[:200]}")
     r.raise_for_status()
@@ -190,14 +204,14 @@ def chat(
                     gen.update(output=text[:8000], usage_details={"input": p, "output": c},
                                cost_details={"input": p * price_in / 1e6, "output": c * price_out / 1e6})
                 return out
-            except (_Retryable, httpx.HTTPError, anthropic.APIStatusError, KeyError, ValueError, json.JSONDecodeError) as e:
+            except (_Retryable, _Fatal, httpx.HTTPError, anthropic.APIStatusError, KeyError, ValueError, json.JSONDecodeError) as e:
                 last = e
-                if isinstance(e, anthropic.BadRequestError):
+                if isinstance(e, (_Fatal, anthropic.BadRequestError)):
                     break  # malformed request: retrying will not help
                 time.sleep(1.5 * (attempt + 1))
         if gen is not None:
             gen.update(level="ERROR", status_message=str(last)[:500])
-    raise RuntimeError(f"LLM call '{name}' failed after {retries} attempts: {last}")
+    raise RuntimeError(f"LLM call '{name}' failed: {last}")
 
 
 def chat_many(jobs: list[dict], concurrency: int | None = None) -> list:

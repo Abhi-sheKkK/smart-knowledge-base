@@ -290,12 +290,18 @@ def _pipeline(col: store.Collection, question: str, usage: llm.Usage, tr: Trace)
             answer = write_answer(col, question, qtype, facets, missing, evidence_units, usage)
         st["output"] = {"answer_chars": len(answer), "n_returned_chunks": len(returned)}
 
+    # API-contract shape: content + metadata.file_name (as in the corpus) + 1-based page_numbers;
+    # extra metadata fields are allowed and ignored by the harness
     chunks = []
     for uid in returned:
         u = col.units[col.unit_idx[uid]]
         chunks.append({
-            "chunk_id": uid, "document": col.docs[u["doc_id"]]["filename"], "page": u["page"],
-            "section": u["header"].split(" | ")[1] if " | " in u["header"] else "",
-            "kind": u["kind"], "grade": grade.get(uid), "text": u["header"] + "\n" + u["text"],
+            "content": u["text"],
+            "metadata": {
+                "file_name": col.docs[u["doc_id"]]["filename"],
+                "page_numbers": [u["page"]],
+                "section": u["header"].split(" | ")[1] if " | " in u["header"] else "",
+                "chunk_id": uid, "kind": u["kind"], "grade": grade.get(uid),
+            },
         })
     return {"answer": answer.strip(), "chunks": chunks}

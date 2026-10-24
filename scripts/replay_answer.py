@@ -43,8 +43,9 @@ def main():
         qtype = plan.get("question_type") if plan.get("question_type") in LIMITS else "analysis"
         facets = [r["question"]] if qtype == "lookup" else ([f for f in plan.get("facets", []) if isinstance(f, str)] or [r["question"]])
         missing = [str(m) for m in plan.get("missing", []) if m]
-        g2 = [c["chunk_id"] for c in r["chunks"] if c.get("grade") == 2]
-        evidence = g2 if len(g2) >= MIN_GRADE2["answer"] else [c["chunk_id"] for c in r["chunks"]]
+        meta = [c.get("metadata", c) for c in r["chunks"]]  # contract format, or older runs
+        g2 = [m["chunk_id"] for m in meta if m.get("grade") == 2]
+        evidence = g2 if len(g2) >= MIN_GRADE2["answer"] else [m["chunk_id"] for m in meta]
         if not evidence:  # abstained in the original run: keep it
             return r
         usage = llm.Usage()

@@ -18,7 +18,7 @@ directly relevant passages only — or abstains. See [`WRITEUP.md`](WRITEUP.md) 
 | `kb/llm.py` | OpenCode client: Claude models via the Anthropic Messages API (official SDK, thinking disabled), others via the OpenAI-compatible endpoint; JSON mode, retries, token/cost accounting, Langfuse generations |
 | `kb/config.py` | Settings from `.env` / environment (models, keys, prices, workers) |
 | `kb/api.py` | FastAPI: `POST /index`, `POST /query`, `GET /health` |
-| `scripts/` | `serve.sh` (run the API), `index_folder.py`, `run_benchmark.py`, `evaluate.py` (organisers' notebook code, unmodified; `--dev-judge`), `replay_answer.py`, `make_gold_run.py`, `check_parse_coverage.py`, `preparse.py` |
+| `scripts/` | `tunnel.sh` (API + ngrok), `serve.sh` (run the API), `page_metrics.py` (contract context scoring), `index_folder.py`, `run_benchmark.py`, `evaluate.py` (organisers' notebook code, unmodified; `--dev-judge`), `replay_answer.py`, `make_gold_run.py`, `check_parse_coverage.py`, `preparse.py` |
 | `Dockerfile`, `requirements.txt` | Deployment (Python 3.12 + tesseract-ocr, pinned dependencies) |
 
 ## Setup
@@ -32,24 +32,28 @@ cp .env.example .env            # LANGFUSE_* keys; OPENCODE_API_KEY optional (th
 
 ## Deploy
 
-### Railway (public HTTPS endpoint)
-1. Railway **Hobby plan** or higher (Free / Trial allow only 0.5–1 GB RAM and 1–2 vCPU — too small for indexing).
-2. New Project → *Deploy from GitHub repo* → this repo. `railway.json` makes Railway build the `Dockerfile` and health-check `/health`.
-3. Service → *Volumes* → add a volume mounted at **`/data`** (collections and caches survive redeploys).
-4. Service → *Variables*: `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_HOST` (optional: `OPENCODE_API_KEY`, `WORKERS`).
-5. Service → *Settings → Networking* → *Generate Domain* → `https://<name>.up.railway.app` is the endpoint.
+### ngrok from a laptop (the organisers' contract)
+```bash
+brew install ngrok
+ngrok config add-authtoken <token>                 # free account, dashboard.ngrok.com
+# claim your free static dev domain on the ngrok dashboard, then:
+NGROK_DOMAIN=<your-domain>.ngrok-free.dev ./scripts/tunnel.sh   # starts API + tunnel, keeps the Mac awake
+./scripts/tunnel.sh stop
+```
+Submit `https://<your-domain>.ngrok-free.dev` (no route). With a static domain the URL survives restarts; keep the machine awake and both processes running during evaluation.
 
-Railway closes requests that send no data for 5 minutes and caps them at 15 minutes, so `/index` streams a newline every 15 s while it works and ends with the JSON result; if indexing outlasts ~13 minutes the final JSON says `"status": "indexing"` and `GET /index/status?collection_name=…` reports completion.
-
-### Docker / plain server
+### Docker / Railway / plain server
 ```bash
 docker build -t smart-kb .
-docker run -d --env-file .env -p 8000:8000 -v kb-data:/data smart-kb
-# or, on a Linux server with Python 3.12 + tesseract-ocr installed:
-./scripts/serve.sh
+docker run -d --env-file .env -p 8000:8000 -v kb-data:/data smart-kb   # listens on $PORT if set
+./scripts/serve.sh                                                      # Linux, Python 3.12 + tesseract-ocr
 ```
+Railway: Hobby plan or higher, deploy this repo (`railway.json`: Dockerfile build, `/health` check), add a volume at `/data`, set the `LANGFUSE_*` variables, generate a domain.
 
-Expected ingestion time: ~15 min cold for ~7,000 pages on 8 cores (state ~20–25 min for headroom); re-indexing unchanged files is near-instant thanks to the parse / embedding caches. `/index` returns 400 at once for a bad or PDF-less zip and 409 while another indexing job runs; otherwise it streams and its final JSON is `{"status": "success" | "error" | "indexing", ...}` (an LLM outage while building cards ends in `"error"` and leaves any existing collection untouched). `/query` returns 404 for an unknown collection, 409 while it is still being indexed, and 502 if the LLM is unavailable.
+### Behaviour that matters for the harness
+- `/index` is synchronous: the first 2xx means the collection is ready. A bad or PDF-less zip returns 400; an LLM outage while building cards returns 502 and leaves any existing collection untouched. Tunnels close connections idle for 5 minutes, so if indexing is still running after 4 minutes the response starts (200) and streams keep-alive whitespace until the final JSON `{"status": "success", "collection_name", "documents_indexed", ...}` (a failure after that point is reported as `"status": "error"` in the body).
+- `/query` returns 404 `{"detail": "unknown collection"}`, 200 with an honest answer and empty chunks when the documents do not contain the answer, and 502 if the LLM is unavailable.
+- Expected ingestion time: ~15 min cold for ~7,000 pages on 8 cores (state ~20–25 min for headroom); unchanged files re-index in seconds (parse / embedding caches).
 
 ## Run the API
 
@@ -67,9 +71,9 @@ curl -H "Content-Type: application/json" \
      http://localhost:8000/query
 ```
 
-`/query` returns `answer`, `chunks` (each with `document`, `page`, `section`, `text`),
-`trace` (array of `{step_name, description, input, output}`) and `metadata`
-(token usage, cost, latency, per-step seconds, Langfuse trace id).
+`/query` returns `answer`, `chunks` (each `{"content", "metadata": {"file_name", "page_numbers", ...}}`,
+file names as in the corpus, 1-based pages), `trace` (array of `{step_name, description, input, output}`)
+and `metadata` (token usage, cost, latency, per-step seconds, Langfuse trace id).
 
 ## Dev loop
 
