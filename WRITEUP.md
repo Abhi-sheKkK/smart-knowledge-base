@@ -54,11 +54,12 @@ Latency breakdown (40-question average): route 3.8 s · retrieve 0.4 s · grade 
 
 | Endpoint | Input | Output / errors |
 |---|---|---|
-| `POST /index` | multipart `file` (zip) + `collection_name` | success + stats when complete; 400 bad / PDF-less zip (non-PDFs listed); 502 if the LLM is unavailable, previous collection untouched |
-| `POST /query` | JSON `collection_name`, `query` | answer, chunks, trace, metadata; 404 unknown collection; 502 if the LLM is unavailable |
+| `POST /index` | multipart `file` (zip) + `collection_name` | streams keep-alive newlines, then `{"status": "success", "stats"}` when complete (`"error"` with the reason, e.g. LLM unavailable — previous collection untouched; `"indexing"` if it outlasts ~13 min); 400 at once for a bad / PDF-less zip |
+| `GET /index/status` | `collection_name` | indexing / success (+ stats) / error |
+| `POST /query` | JSON `collection_name`, `query` | answer, chunks, trace, metadata; 404 unknown collection; 409 still indexing; 502 if the LLM is unavailable |
 | `GET /health` | — | `{"status": "ok"}` |
 
-Deployment: Docker image (Python 3.12 + Tesseract, pinned dependencies, embedding model baked in, `/data` volume) or `scripts/serve.sh`. Stated ingestion time: ~15 min cold for ~7,000 pages on 8 cores (quote 20–25 min with headroom).
+Deployment: Docker image (Python 3.12 + Tesseract, pinned dependencies, embedding model baked in, `/data` volume, listens on `$PORT`), deployed on Railway (`railway.json`: Dockerfile build, `/health` check) for a public HTTPS endpoint, or `scripts/serve.sh` on any Linux server. The streamed `/index` response keeps proxies that close idle or long requests (Railway: 5 min idle, 15 min total) from cutting off ingestion. Stated ingestion time: ~15 min cold for ~7,000 pages on 8 cores (quote 20–25 min with headroom).
 
 ## 6. Design decisions (measured on the same questions)
 

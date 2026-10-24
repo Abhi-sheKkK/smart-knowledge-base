@@ -32,16 +32,24 @@ cp .env.example .env            # LANGFUSE_* keys; OPENCODE_API_KEY optional (th
 
 ## Deploy
 
+### Railway (public HTTPS endpoint)
+1. Railway **Hobby plan** or higher (Free / Trial allow only 0.5–1 GB RAM and 1–2 vCPU — too small for indexing).
+2. New Project → *Deploy from GitHub repo* → this repo. `railway.json` makes Railway build the `Dockerfile` and health-check `/health`.
+3. Service → *Volumes* → add a volume mounted at **`/data`** (collections and caches survive redeploys).
+4. Service → *Variables*: `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_HOST` (optional: `OPENCODE_API_KEY`, `WORKERS`).
+5. Service → *Settings → Networking* → *Generate Domain* → `https://<name>.up.railway.app` is the endpoint.
+
+Railway closes requests that send no data for 5 minutes and caps them at 15 minutes, so `/index` streams a newline every 15 s while it works and ends with the JSON result; if indexing outlasts ~13 minutes the final JSON says `"status": "indexing"` and `GET /index/status?collection_name=…` reports completion.
+
+### Docker / plain server
 ```bash
-# Docker (includes tesseract-ocr; collections persist in the /data volume)
 docker build -t smart-kb .
 docker run -d --env-file .env -p 8000:8000 -v kb-data:/data smart-kb
-
-# or directly on a Linux server (Python 3.12 + tesseract-ocr installed)
+# or, on a Linux server with Python 3.12 + tesseract-ocr installed:
 ./scripts/serve.sh
 ```
 
-Expected ingestion time: ~15 min cold for ~7,000 pages on 8 cores (state ~20–25 min for headroom); re-indexing unchanged files is near-instant thanks to the parse / embedding caches. `/index` returns 400 for a bad or PDF-less zip and 502 (leaving any existing collection untouched) if the LLM is unavailable while building document cards; `/query` returns 404 for an unknown collection and 502 if the LLM is unavailable.
+Expected ingestion time: ~15 min cold for ~7,000 pages on 8 cores (state ~20–25 min for headroom); re-indexing unchanged files is near-instant thanks to the parse / embedding caches. `/index` returns 400 at once for a bad or PDF-less zip and 409 while another indexing job runs; otherwise it streams and its final JSON is `{"status": "success" | "error" | "indexing", ...}` (an LLM outage while building cards ends in `"error"` and leaves any existing collection untouched). `/query` returns 404 for an unknown collection, 409 while it is still being indexed, and 502 if the LLM is unavailable.
 
 ## Run the API
 

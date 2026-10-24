@@ -35,7 +35,22 @@ def price(model: str) -> tuple[float, float]:
 
 EMBED_MODEL = os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")  # quantised bge-small runs ~11 texts/s on CPU
 DATA_DIR = Path(os.getenv("DATA_DIR", ROOT / "data" / "collections"))
-WORKERS = int(os.getenv("WORKERS", str(max(2, (os.cpu_count() or 4) - 2))))
+def _available_cpus() -> int:
+    """CPUs this process may really use: the container's cgroup quota when there is one
+    (os.cpu_count() reports the whole host inside Docker / Railway), else the affinity mask."""
+    try:
+        quota, period = Path("/sys/fs/cgroup/cpu.max").read_text().split()[:2]
+        if quota != "max":
+            return max(1, int(int(quota) / int(period)))
+    except (OSError, ValueError):
+        pass
+    try:
+        return len(os.sched_getaffinity(0))
+    except AttributeError:  # macOS
+        return os.cpu_count() or 4
+
+
+WORKERS = int(os.getenv("WORKERS", str(max(2, _available_cpus() - 1))))
 LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "8"))
 
 LANGFUSE_ENABLED = bool(os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY"))

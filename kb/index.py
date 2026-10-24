@@ -269,6 +269,15 @@ def build_collection(name: str, pdf_paths: list[Path], log=print) -> dict:
 
 
 def index_zip(name: str, zip_path: Path, log=print) -> dict:
+    pdfs, skipped = extract_zip(name, zip_path, log=log)
+    stats = build_collection(name, pdfs, log=log)
+    stats["skipped_non_pdf"] = skipped
+    return stats
+
+
+def extract_zip(name: str, zip_path: Path, log=print) -> tuple[list[Path], list[str]]:
+    """Unpack the PDFs of an upload into the collection's raw folder (fast; raises
+    zipfile.BadZipFile / ValueError for unusable uploads before any heavy work starts)."""
     raw = store.collection_dir(name).with_name(store.collection_dir(name).name + ".raw")
     shutil.rmtree(raw, ignore_errors=True)
     raw.mkdir(parents=True)
@@ -292,6 +301,4 @@ def index_zip(name: str, zip_path: Path, log=print) -> dict:
         raise ValueError(f"the zip contains no PDF files (skipped: {skipped[:20]})")
     if skipped:
         log(f"skipped {len(skipped)} non-PDF files: {skipped[:20]}")
-    stats = build_collection(name, pdfs, log=log)
-    stats["skipped_non_pdf"] = skipped
-    return stats
+    return pdfs, skipped

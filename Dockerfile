@@ -19,5 +19,6 @@ ENV DATA_DIR=/data/collections
 VOLUME ["/data"]
 
 EXPOSE 8000
-# secrets (OPENCODE_API_KEY, LANGFUSE_*) are passed at run time: docker run --env-file .env ...
-CMD ["uvicorn", "kb.api:app", "--host", "0.0.0.0", "--port", "8000", "--timeout-keep-alive", "3600"]
+# secrets (LANGFUSE_*, optional OPENCODE_API_KEY) are passed at run time: docker run --env-file .env ...
+# PORT is set by platforms such as Railway; 8000 otherwise
+CMD ["sh", "-c", "exec uvicorn kb.api:app --host 0.0.0.0 --port ${PORT:-8000} --timeout-keep-alive 75"]
