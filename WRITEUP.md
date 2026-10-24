@@ -1,74 +1,65 @@
-# Smart Knowledge Base for Agents — Architecture & Design Decisions
+# Smart Knowledge Base for Agents — Solution Write-up
 
-## 1. Idea in one paragraph
+## 1. Overview
 
-Plain retrieval fails in two ways the brief names: near-duplicate documents (same topic, different year / version / entity) are confused, and answers spread over many pages are only partly retrieved. Our engine treats retrieval as **navigation before similarity**. At ingestion it reads the unorganised dump and builds, per document, a **card** (entity, type, period, status, …), **"how to tell apart" notes** for look-alike documents, and a **page-bounded section tree**. At query time an LLM first **routes** the question to the right documents using those cards; search then runs only **inside** those documents, once per checklist item; a fast LLM **grades** every candidate passage; and a single **answer** call writes a cited answer from the directly relevant passages only, or abstains.
+Two pipelines share a named collection. **Indexing** (`POST /index`) turns an unlabelled folder of PDFs into a navigable library: page-bounded text units, a section tree per document, an LLM-written **card** per document and **"how to tell apart" notes** for look-alike documents, plus a local search index. **Querying** (`POST /query`) runs four steps — **route → retrieve → grade → answer** — of which only route and answer are sequential LLM calls. Every LLM call uses **Claude Haiku 5.5 with thinking disabled** (no hidden reasoning tokens); embeddings and keyword search run locally.
 
-## 2. Ingestion — `POST /index` (`kb/parse.py`, `kb/index.py`)
+| | Value (measured on the training corpus / 40 test questions) |
+|---|---|
+| Indexing | ≈ 15 min cold for 36 PDFs, 7,091 pages (8 cores); 48 LLM calls ≈ $0.05; re-indexing unchanged files: seconds |
+| Query | 23.4 s average · $0.016 · ≈ 130k input + 6k output tokens · 22 LLM calls (≈ 20 of them parallel grading) |
+| Quality (held-out 20) | Answer P 0.37 · Answer R 0.56 · Context P 0.86 · Context R 0.54 |
 
-| Step | What it does | Why |
-|---|---|---|
-| Parse | PyMuPDF (pinned 1.26.5) in a crash-safe process pool; ruled tables → markdown; Tesseract OCR for pages without a text layer; ligature / number normalisation; running headers and footers removed | One training PDF is fully scanned; MuPDF can segfault on odd pages, so a dead worker never stalls ingestion |
-| Structural units | Text split along headings, **never across a page**, ~250–2,200 characters; each unit attached to a section tree built from the PDF outline or detected headings | Citations need document + page; sections give the "whole topic" a question may need |
-| Document cards | 1 LLM call per document: title, entity, issuer, type, period, date, jurisdiction, status, topics, summary | File names are unreliable (renamed files, register numbers, scanner names); identity must come from content |
-| Look-alike notes | MinHash text overlap or same entity + type → an LLM writes how the two documents differ | Directly targets failure mode 1 (near-duplicates) |
-| Contextual headers + index | Each unit prefixed `[document | section path | page]`, embedded with MiniLM (local, no per-query cost) + BM25 | Headers carry year / entity into search; local embeddings keep query cost at LLM calls only |
+## 2. Indexing — `POST /index` (`kb/parse.py`, `kb/index.py`)
 
-Ingestion of the training corpus (36 PDFs, 7,091 pages, 24,013 units): **≈ 15 minutes cold** on 8 cores (9 min parsing incl. OCR, ~6 min cards + embeddings, 48 LLM calls ≈ $0.05). Parse and embedding caches make re-indexing unchanged files near-instant. Multiple named collections are kept side by side; a collection is built in a temporary folder and swapped in only when complete.
+**2.1 Parse.** PyMuPDF 1.26.5 runs in a crash-safe process pool: if a worker dies on a malformed page, the pool is rebuilt and the affected pages are retried one at a time, then without table detection; a page that still fails is kept empty, so one bad page never stops ingestion. Pages with no text layer are OCR'd with Tesseract at 220 dpi (one training PDF is fully scanned). Ruled tables are detected only on pages with vector lines and stored as markdown units. Lines repeated on ≥ 25% of pages (running headers/footers) are removed; text is NFKC-normalised (ligatures `ﬁ`→`fi`) and split thousands separators are re-joined (`60, 000`→`60,000`).
 
-## 3. Query — `POST /query` (`kb/query.py`): route → retrieve → grade → answer
+**2.2 Structure.** Text is accumulated per section and page into **units of 250–2,200 characters (target 1,200) that never cross a page**, so every citation carries an exact page number. Each document gets a **section tree**: from the PDF outline when it has ≥ 5 entries, otherwise from headings detected by dominant font size and weight (wrapped headings merged); OCR'd pages use numbering / capitals rules. Each unit keeps its section path, which retrieval later uses to expand a hit to its section. Training corpus: 24,013 units, 14,580 sections; 0.94 of the gold passages' words are recovered on the correct page.
 
-| # | Step | LLM | What it does |
-|---|---|---|---|
-| 1 | `route` | 1 call (Haiku 5.5) | Reads the whole card catalogue: picks documents (matching entity / period / version, preferring a specific document over a compendium), classifies the question (lookup / analysis / comparison), writes a checklist and search queries, flags documents the question needs but the collection lacks |
-| 2 | `retrieve` | — | Dense + BM25 search **restricted to the routed documents**, one search per query and checklist item (merged by best score); hits expanded to their small leaf section; near-duplicates collapsed; round-robin budget across documents so one large document cannot crowd out others; falls back to the whole collection if routing is empty or unsure |
-| 3 | `grade` | parallel Haiku calls | Every candidate graded 2 = directly answers / 1 = needed context / 0 = not needed (topic-only, boilerplate, wrong entity / period / version) |
-| 4 | `answer` | 1 call (Haiku 5.5) | Written only from grade-2 passages, bounded length (lookup ≤ 150 words, analysis ≤ 600, comparison ≤ 650), every claim cited `[file pN]`, explicit "the documents do not state …" for gaps and for missing documents; **abstains with no chunks** when nothing is directly relevant |
+**2.3 Catalogue.** One LLM call per document (opening pages, outline, two sampled pages) writes a **document card**: title, short title, entity, issuer, document type, period / fiscal year, date, jurisdiction, status (final / proposed / …), topics, summary. Document identity comes from content, never from the file name. **Look-alike pairs** are found by MinHash over word 5-grams (LSH threshold 0.15) or by the same entity and document type; for each pair an LLM writes a difference note stored on both cards. Real example (12 pairs in the training corpus): *"A is the FY 2024-25 annual report while B is the FY 2025-26 annual report for the same entity. Use A for questions about fiscal year 2024-25 and B for 2025-26."*
 
-The response carries `answer`, `chunks` (document, page, section, grade, text) and `trace` (one `{step_name, description, input, output}` per step); every step and LLM call is also a Langfuse span / generation with tokens and cost.
+**2.4 Index.** Every unit is prefixed with a contextual header `[short title | section path | page]`, so year and entity travel with the text into both indexes: **MiniLM** embeddings (local ONNX, no per-query API cost) and **BM25**. Parse output is cached by file hash + parser and library version, embeddings by text hash. A collection is built in a temporary folder and swapped in only when complete; if more than half of the card calls fail, `/index` returns an error and the previous collection is untouched.
 
-**How it addresses the two failure modes.** Near-duplicates are resolved at the *document* level (cards + look-alike notes) before similarity search runs, so similar text from the wrong year or entity never competes. The chunk-size dilemma is handled by searching per checklist item, expanding hits to their sections, and letting the grader decide relevance passage by passage, instead of hoping a larger top-k happens to contain everything.
+## 3. Querying — `POST /query` (`kb/query.py`)
 
-## 4. Results (training set, dev judge)
+**3.1 route — 1 LLM call, 3.8 s.** Input: the question and the whole catalogue (one line per document: card fields + look-alike notes). Output: `question_type` (lookup / analysis / comparison), `facets` (a checklist of what the answer must cover; for a lookup, the question itself), `documents` with reasons, `missing` (documents the question refers to that the collection lacks), 3–6 `search_queries` in the documents' vocabulary, and `confidence`. Prompt rules: match entity, period, version and status exactly using the look-alike notes; prefer a specific document (named reform, proposal, year) over a large compendium. **Near-duplicates are resolved here, at the document level, before any similarity search.** On average 3.8 documents are routed.
 
-The supplied evaluator's configured judge (a reasoning model) exhausts its 10,000-token budget on long answers and returns empty JSON, so we self-evaluated with the **notebook code unmodified** but its requests answered by Claude Haiku 5.5 (thinking disabled). 40 questions: 20 used during development + 20 held-out never used for tuning.
+**3.2 retrieve — no LLM, 0.4 s.** (1) Probes = the question + search queries + checklist items. (2) For each probe, dense and BM25 search **restricted to the routed documents**, fused by reciprocal rank; each unit keeps its best score. If routing returned nothing or low confidence, the whole collection is searched as well. (3) Each hit expands to its leaf section when that section is small. (4) Near-identical units (repeated boilerplate) collapse to one. (5) A round-robin across documents fills the candidate budget, so a 1,982-page compendium cannot crowd out a 14-page memo. On average ≈ 150 hits become ≈ 199 candidates.
 
-| Set | Answer P | Answer R | Context P | Context R | Latency / query | Cost / query |
+| Question type | Search hits kept | Candidates graded | Leaf expansion (max units) | Answer length cap |
+|---|---|---|---|---|
+| lookup | 30 | 60 | 4 | 150 words |
+| analysis | 150 | 200 | 10 | 600 words |
+| comparison | 180 | 240 | 10 | 650 words |
+
+**3.3 grade — parallel LLM calls, 11.5 s.** Every candidate is graded for this question: **2** = directly answers a checklist item; **1** = context a grade-2 fact needs (definition, condition, comparison period, caveat); **0** = not needed (topic only, boilerplate, wrong entity / period / version). The test is worded like the evaluator's ("genuinely relevant and useful"); for lookups, grade 2 requires the passage to state the fact. Batches of 10 passages (clipped to 1,800 characters), 24 calls in parallel. If every batch fails, the request returns HTTP 502 rather than a silent "nothing found". On average 38 grade-2 and 54 grade-1 passages; the returned chunks are the grade-2 passages (plus grade-1 when fewer than 15), ≈ 42 per query.
+
+**3.4 answer — 1 LLM call, 7.5 s.** Written only from grade-2 passages (plus grade-1 when fewer than 8), in document order. Every sentence or bullet ends with `[file pN]`; length is capped near the gold answers' size (table above); a checklist item without evidence gets "The documents do not state …"; missing documents are named. If no passage is grade 2, the system **abstains** ("No information was retrieved…") and returns no chunks.
+
+**3.5 Response.** `answer`, `chunks` (document, page, section, grade, text), `trace` (one `{step_name, description, input, output}` per step) and `metadata` (tokens, cost, latency, per-step seconds, Langfuse trace id). Every step is a Langfuse span and every LLM call a Langfuse generation with usage and cost.
+
+## 4. Performance
+
+Scored with the organisers' evaluation notebook code, unmodified; its configured judge (a reasoning model) cannot score long answers within its token budget, so its requests were answered by Claude Haiku 5.5. The ceiling row scores the gold answers and gold chunks as if they were our output.
+
+| Question set | Answer P | Answer R | Context P | Context R | Latency | Cost / query |
 |---|---|---|---|---|---|---|
-| Development 20 | 0.32 | 0.62 | 0.92 | 0.57 | 24 s | $0.017 |
-| Held-out 20 | 0.37 | 0.56 | 0.86 | 0.54 | 22 s | $0.016 |
-| Judge ceiling (gold answers / chunks scored as ours) | ≈ 0.95 | ≈ 0.97 | ≈ 0.78 | ≈ 0.78 | | |
+| Development (20) | 0.32 | 0.62 | 0.92 | 0.57 | 24.4 s | $0.017 |
+| Held-out (20, never used for tuning) | 0.37 | 0.56 | 0.86 | 0.54 | 22.4 s | $0.016 |
+| Judge ceiling | ≈ 0.95 | ≈ 0.97 | ≈ 0.78 | ≈ 0.78 | | |
 
-Context precision exceeds what the judge awards the gold chunks themselves; context recall and the answer metrics are the remaining gap. Cost: ≈ 145k input + 9k output Haiku tokens per query.
+Latency breakdown (40-question average): route 3.8 s · retrieve 0.4 s · grade 11.5 s · answer 7.5 s. Context precision exceeds what the judge awards the gold chunks; held-out matches development; the remaining gap is answer composition.
 
-## 5. What we tried and dropped (measured on the same questions)
+## 5. API and operations
 
-| Idea | Effect | Decision |
+| Endpoint | Input | Output / errors |
 |---|---|---|
-| LLM section selection over the document tree (PageIndex-style), gap-fill round, editor pass, primary/supporting weighting (pipeline v1, 9 steps) | Same scores within noise as the 4-step pipeline, ~21% slower, ~14% more expensive | Removed |
-| Claim bank: extract atomic claims, select per checklist item, write facet by facet | Answer recall ↑ (0.65) but precision ↓ (0.20–0.25): answers carried more points than the gold | Dropped |
-| Returning grade-1 "context" passages as chunks | Context recall ↑ (0.80) but precision ↓ (0.63) | Only when grade-2 evidence is thin |
-| deepseek-v4.1-flash for the pipeline | Provider stopped allowing reasoning to be disabled → 3 min / query | Replaced by Claude Haiku 5.5 (no hidden reasoning) |
-
-## 6. Limitations and next steps
-
-- Multi-document regulatory comparisons (family B) have the lowest answer precision: answers mix rules from 3–4 documents. Next: answer sections per document / regime.
-- Tables without ruled lines in annual reports are parsed as text (gold-text coverage 0.72–0.77 on three reports).
-- Only PDFs are indexed (other files in the zip are skipped and reported).
-- Routing sends the whole card catalogue in one prompt — comfortable up to a few hundred documents.
-
-## 7. API, deployment and how to test
-
-| Endpoint | Input | Output |
-|---|---|---|
-| `POST /index` | multipart: `file` (zip of documents), `collection_name` | `{"status": "success", "collection_name", "stats"}` once indexing is complete; 400 for a bad / PDF-less zip, 502 if the LLM is unavailable (existing collection untouched) |
-| `POST /query` | JSON: `{"collection_name", "query"}` | `{"answer", "chunks": [{document, page, section, grade, text}], "trace": [{step_name, description, input, output}], "metadata": {usage, cost, latency, step_seconds, langfuse_trace_id}}` |
+| `POST /index` | multipart `file` (zip) + `collection_name` | success + stats when complete; 400 bad / PDF-less zip (non-PDFs listed); 502 if the LLM is unavailable, previous collection untouched |
+| `POST /query` | JSON `collection_name`, `query` | answer, chunks, trace, metadata; 404 unknown collection; 502 if the LLM is unavailable |
 | `GET /health` | — | `{"status": "ok"}` |
 
-```
-docker build -t smart-kb . && docker run -d --env-file .env -p 8000:8000 -v kb-data:/data smart-kb
-curl -F "file=@corpus.zip" -F "collection_name=test" http://<host>:8000/index
-curl -H "Content-Type: application/json" -d '{"collection_name": "test", "query": "..."}' http://<host>:8000/query
-```
+Deployment: Docker image (Python 3.12 + Tesseract, pinned dependencies, embedding model baked in, `/data` volume) or `scripts/serve.sh`. Stated ingestion time: ~15 min cold for ~7,000 pages on 8 cores (quote 20–25 min with headroom).
 
-Stated ingestion time: ~15 min cold for ~7,000 pages on 8 cores (quote ~20–25 min with headroom). Stack: Python 3.12, FastAPI, PyMuPDF 1.26.5, Tesseract, fastembed (MiniLM), rank-bm25, datasketch, Anthropic SDK → OpenCode, Langfuse. Source: private GitHub repository `smart-knowledge-base`.
+## 6. Design decisions (measured on the same questions)
+
+The current four steps replaced a nine-step version: LLM navigation of the section tree, a gap-fill round, an editor pass and document weighting gave the same scores within noise while costing ~21% more latency and ~14% more money, so they were removed. A claim-bank answer composer raised answer recall (0.65) but cut precision (0.20–0.25), so answers are written from graded passages. Known limits: multi-document regulatory comparisons have the lowest answer precision; tables without ruling lines are parsed as text; only PDFs are indexed; routing sends the whole catalogue in one prompt (comfortable up to a few hundred documents).
